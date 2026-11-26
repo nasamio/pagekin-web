@@ -33,10 +33,13 @@ import { getActiveProjectSessionContext, sameProjectSessionContext } from '../..
 import { livePreview, paperHeadFacet, type PaperHead } from './live-preview'
 import InlineAnnotationReview from './InlineAnnotationReview'
 import { commandKeyLabel, isComposing } from '../stage/shortcut-keys'
+import { ipc } from '../../services/ipc-client'
+import type { WebPendingRevisionPayload } from '../../shared/ipc-channels'
 
 export type CodeMirrorEditorProps = {
   content: string
   filePath?: string
+  draftId?: number
   /** 章内正文才有；有它时选区生成带上本章材料。 */
   chapterNumber?: number
   recoveryHandle?: MainGenerationRunHandle
@@ -124,6 +127,7 @@ const annotationDecorationField = StateField.define<DecorationSet>({
 export default function CodeMirrorEditor({
   content,
   filePath,
+  draftId,
   chapterNumber,
   recoveryHandle,
   recoveryNonce,
@@ -159,6 +163,9 @@ export default function CodeMirrorEditor({
   const [annotations, setAnnotations] = useState<EditorInlineAnnotation[]>([])
   const [inlineReview, setInlineReview] = useState<{ before: string; after: string; annotations: EditorInlineAnnotation[]; sessionKey: string; filePath?: string
     client: ReturnType<typeof createEditorInlineGeneration>; candidate: { artifactId: string; textHash: string } } | null>(null)
+  const [mcpReview, setMcpReview] = useState<WebPendingRevisionPayload | null>(null)
+  const annotationHydratedKeyRef = useRef<string | null>(null)
+  const authorMutatedAnnotationsRef = useRef(false)
   const hasEmittedInitialCount = useRef(false)
   const composingRef = useRef(false)
   const pendingExternalContentRef = useRef<string | null>(null)
@@ -322,7 +329,59 @@ export default function CodeMirrorEditor({
   const bubbleInSight = bubbleOpen && bubblePos.inView
   // 空串加报错是生成失败、没有可处理的结果，不再算进行中。
   const batchPending = activeAIAction === 'batch-instruct' && aiResult !== null && !(aiResult === '' && aiError !== null)
-  const annotationRevision: AnnotationRevisionPhase | null = inlineReview ? 'review' : batchPending ? 'preview' : null
+  const annotationRevision: AnnotationRevisionPhase | null = (inlineReview || mcpReview) ? 'review' : batchPending ? 'preview' : null
+
+  // Web/MCP 协同：加载与防抖持久化未提交的段落批注，并接收外部 MCP Agent 推回的 Diff 修订
+  useEffect(() => {
+    if (!chapterAnnotations) return
+    const session = getActiveProjectSessionContext()
+    if (!session) return
+    const key = `${session.projectPath}:${draftId ?? ''}:${chapterNumber ?? ''}`
+    let cancelled = false
+    annotationHydratedKeyRef.current = null
+    authorMutatedAnnotationsRef.current = false
+    void ipc.invoke('web:pending-annotations:get', draftId, chapterNumber, session.projectPath)
+      .then(saved => {
+        if (cancelled) return
+        annotationHydratedKeyRef.current = key
+        if (Array.isArray(saved) && saved.length > 0) setAnnotations(saved)
+      })
+      .catch(() => { annotationHydratedKeyRef.current = key })
+    if (draftId !== undefined) {
+      void ipc.invoke('web:pending-revision:get', draftId, session.projectPath)
+        .then(rev => {
+          if (!cancelled && rev) setMcpReview(rev)
+        })
+        .catch(() => undefined)
+    }
+    return () => { cancelled = true }
+  }, [chapterAnnotations, draftId, chapterNumber])
+
+  useEffect(() => {
+    if (!chapterAnnotations) return
+    const session = getActiveProjectSessionContext()
+    if (!session) return
+    const key = `${session.projectPath}:${draftId ?? ''}:${chapterNumber ?? ''}`
+    if (annotationHydratedKeyRef.current !== key || !authorMutatedAnnotationsRef.current) return
+    const timer = window.setTimeout(() => {
+      void ipc.invoke('web:pending-annotations:set', draftId, chapterNumber, annotations, session.projectPath).catch(() => undefined)
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [annotations, chapterAnnotations, draftId, chapterNumber])
+
+  useEffect(() => {
+    if (!chapterAnnotations) return
+    try {
+      return ipc.on('mcp:revision-submitted', payload => {
+        if ((draftId !== undefined && payload.draftId === draftId)
+          || (chapterNumber !== undefined && payload.chapterNumber === chapterNumber)) {
+          setMcpReview(payload)
+        }
+      })
+    } catch {
+      return undefined
+    }
+  }, [chapterAnnotations, draftId, chapterNumber])
   const revealPreview = useCallback(() => {
     const view = editorRef.current?.view
     const target = aiTargetRef.current
@@ -705,6 +764,7 @@ export default function CodeMirrorEditor({
       selectedText: view.state.sliceDoc(selectionRange.from, selectionRange.to),
       instruction,
     }
+    authorMutatedAnnotationsRef.current = true
     setAnnotations([...annotations, annotation].sort((a, b) => a.from - b.from || a.to - b.to))
     setNoteDraft(null)
     setNoteError(null)
@@ -720,10 +780,12 @@ export default function CodeMirrorEditor({
   }
 
   const removeAnnotation = (id: string) => {
+    authorMutatedAnnotationsRef.current = true
     setAnnotations(annotations.filter(annotation => annotation.id !== id))
   }
 
   const clearAnnotations = () => {
+    authorMutatedAnnotationsRef.current = true
     setAnnotations([])
   }
 
@@ -826,7 +888,7 @@ export default function CodeMirrorEditor({
           void Promise.resolve(onSave?.(lastEmittedContentRef.current)).catch(() => undefined)
         }
       }}>
-      <div hidden={Boolean(inlineReview)} className={fitContent ? 'relative' : 'flex-1 relative min-h-0 min-w-0 overflow-hidden'}>
+      <div hidden={Boolean(inlineReview || mcpReview)} className={fitContent ? 'relative' : 'flex-1 relative min-h-0 min-w-0 overflow-hidden'}>
         <div className={fitContent ? undefined : 'absolute inset-0'}>
           <CodeMirror
             ref={editorRef}
@@ -853,7 +915,27 @@ export default function CodeMirrorEditor({
           if (!run || run.sourceStatus !== 'current' || run.view.status === 'cancelled'
             || !(run.view.candidates ?? run.view.artifacts).some(candidate => candidate.artifactId === inlineReview.candidate.artifactId && candidate.textHash === inlineReview.candidate.textHash && candidate.text === inlineReview.after && candidate.status === 'completed' && candidate.compositionEligible === true)) throw new Error('SOURCE_DRAFT_CHANGED')
           await onCommitAnnotations(inlineReview.before, after, inlineReview.annotations)
+          authorMutatedAnnotationsRef.current = true
           setAnnotations([]); setInlineReview(null)
+        }} />}
+      {mcpReview && onCommitAnnotations && <InlineAnnotationReview before={mcpReview.before} after={mcpReview.after} annotations={mcpReview.annotations}
+        onCancel={() => {
+          const session = getActiveProjectSessionContext()
+          if (session) void ipc.invoke('web:pending-revision:clear', mcpReview.draftId, session.projectPath).catch(() => undefined)
+          setMcpReview(null)
+        }}
+        onCommit={async after => {
+          const session = getActiveProjectSessionContext()
+          if (draftReadonlyRef.current) throw new Error('DRAFT_NOT_WRITABLE')
+          if (!editableRef.current) throw new Error('DRAFT_NOT_EDITABLE')
+          await onCommitAnnotations(mcpReview.before, after, mcpReview.annotations)
+          authorMutatedAnnotationsRef.current = true
+          setAnnotations([])
+          if (session) {
+            void ipc.invoke('web:pending-annotations:clear', draftId, chapterNumber, session.projectPath).catch(() => undefined)
+            void ipc.invoke('web:pending-revision:clear', mcpReview.draftId, session.projectPath).catch(() => undefined)
+          }
+          setMcpReview(null)
         }} />}
       {/* 选区工具条：纸墨浮层，自带纸墨令牌与深浅色 */}
       {bubbleOpen && (editable || aiResult !== null) && bubblePos.top !== 0 && (

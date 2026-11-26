@@ -4,7 +4,10 @@ node_modules
 # 构建输出
 dist
 dist-electron
+dist-web
+dist-server
 release
+data
 electron/security/*.exe
 
 # 日志

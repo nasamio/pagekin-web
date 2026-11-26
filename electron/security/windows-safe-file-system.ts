@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { existsSync, realpathSync, statSync } from 'node:fs'
+import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import * as electron from 'electron'
 
@@ -514,6 +514,104 @@ export function createSecureFileSystem(
   )
   const cwd = options.cwd ?? process.cwd()
   const usingTestInvoke = options.invoke !== undefined
+  const usingPosixNodeFs = !usingTestInvoke && platform === 'linux'
+
+  function resolvePosixSafePath(capability: SecureFileCapability, requireLeafExists: boolean): { root: string; target: string; segments: string[] } {
+    const safe = validateCapability(capability)
+    const root = realpathSync.native(safe.rootPath)
+    const info = statSync(root, { bigint: true })
+    if (!info.isDirectory() || info.dev.toString() !== safe.rootIdentity.volumeSerialNumber || info.ino.toString() !== safe.rootIdentity.fileIndex) {
+      throw secureError('SECURE_FS_ROOT_MISMATCH')
+    }
+    const segments = safe.relativePath ? safe.relativePath.split('\\').filter(Boolean) : []
+    let cursor = root
+    for (let i = 0; i < segments.length; i++) {
+      cursor = path.join(cursor, segments[i]!)
+      const isLast = i === segments.length - 1
+      let stat: ReturnType<typeof lstatSync> | undefined
+      try {
+        stat = lstatSync(cursor)
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT' && !requireLeafExists) continue
+        throw secureError('SECURE_FS_NOT_FOUND')
+      }
+      if (stat.isSymbolicLink()) throw secureError('SECURE_FS_UNSAFE_LINK')
+      if (!isLast && !stat.isDirectory()) throw secureError('SECURE_FS_INVALID_PATH')
+    }
+    return { root, target: cursor, segments }
+  }
+
+  async function invokePosix(request: HelperRequest, beforeReplace?: () => void | Promise<void>): Promise<HelperResponse> {
+    const cap: SecureFileCapability = { rootPath: request.rootPath, relativePath: request.relativePath, rootIdentity: request.rootIdentity }
+    if (request.operation === 'exists') {
+      try {
+        const { target } = resolvePosixSafePath(cap, true)
+        return { ok: true, exists: existsSync(target) }
+      } catch (err) {
+        if (err instanceof Error && err.message === 'SECURE_FS_NOT_FOUND') return { ok: true, exists: false }
+        throw err
+      }
+    }
+    if (request.operation === 'mkdir') {
+      const { root, segments } = resolvePosixSafePath(cap, false)
+      let cursor = root
+      for (const seg of segments) {
+        cursor = path.join(cursor, seg)
+        if (!existsSync(cursor)) mkdirSync(cursor)
+        else if (lstatSync(cursor).isSymbolicLink() || !lstatSync(cursor).isDirectory()) throw secureError('SECURE_FS_INVALID_PATH')
+      }
+      return { ok: true }
+    }
+    if (request.operation === 'list') {
+      const { target } = resolvePosixSafePath(cap, true)
+      const entries = readdirSync(target, { withFileTypes: true })
+        .filter(e => !e.isSymbolicLink() && (e.isDirectory() || e.isFile()))
+        .slice(0, MAX_DIRECTORY_ENTRIES)
+        .map(e => ({ name: e.name, isDirectory: e.isDirectory() }))
+      return { ok: true, entries }
+    }
+    if (request.operation === 'read') {
+      const { target } = resolvePosixSafePath(cap, true)
+      const limit = normalizeReadByteLimit(request.maxBytes)
+      const fd = openSync(target, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+      try {
+        const st = lstatSync(target)
+        if (st.size > limit) throw secureError('SECURE_FS_FILE_TOO_LARGE')
+        const buf = readFileSync(fd)
+        if (buf.length > limit) throw secureError('SECURE_FS_FILE_TOO_LARGE')
+        return { ok: true, contentBase64: buf.toString('base64') }
+      } finally {
+        closeSync(fd)
+      }
+    }
+    if (request.operation === 'write') {
+      const { root, segments, target } = resolvePosixSafePath(cap, false)
+      const parentDir = path.dirname(target)
+      let cursor = root
+      for (let i = 0; i < segments.length - 1; i++) {
+        cursor = path.join(cursor, segments[i]!)
+        if (!existsSync(cursor)) mkdirSync(cursor)
+      }
+      const tempPath = path.join(parentDir, `.${path.basename(target)}.${process.pid}.${Date.now()}.tmp`)
+      const buf = Buffer.from(request.contentBase64 ?? '', 'base64')
+      const fd = openSync(tempPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600)
+      try {
+        writeFileSync(fd, buf)
+      } finally {
+        closeSync(fd)
+      }
+      try {
+        await beforeReplace?.()
+        renameSync(tempPath, target)
+      } catch (err) {
+        try { unlinkSync(tempPath) } catch { /* ignore */ }
+        throw err
+      }
+      return { ok: true }
+    }
+    throw secureError('SECURE_FS_INVALID_OPERATION')
+  }
+
   const securePlatform = (): SecureFileSystemPlatform => {
     if (platform === 'win32' || platform === 'darwin') return platform
     throw secureError('SECURE_FS_UNSUPPORTED_PLATFORM')
@@ -544,10 +642,12 @@ export function createSecureFileSystem(
     if (!existsSync(helperPath)) throw secureError('SECURE_FS_HELPER_UNAVAILABLE')
     return helperPath
   }
-  const invoke = options.invoke ?? ((request: HelperRequest) => {
-    const supportedPlatform = securePlatform()
-    return invokeBundledHelper(request, supportedPlatform, resolveHelperPath(), timeoutMs)
-  })
+  const invoke = options.invoke ?? (usingPosixNodeFs
+    ? ((request: HelperRequest) => invokePosix(request))
+    : ((request: HelperRequest) => {
+      const supportedPlatform = securePlatform()
+      return invokeBundledHelper(request, supportedPlatform, resolveHelperPath(), timeoutMs)
+    }))
 
   const run = async (
     operation: HelperOperation,
@@ -611,6 +711,11 @@ export function createSecureFileSystem(
         const response = await invoke(request)
         if (!response.ok) responseError(response)
         await beforeReplace?.()
+        return
+      }
+      if (usingPosixNodeFs) {
+        const response = await invokePosix(request, beforeReplace)
+        if (!response.ok) responseError(response)
         return
       }
       const supportedPlatform = securePlatform()

@@ -137,6 +137,20 @@ function DraftChapter({ tab, filePath, projectKey }: { tab: EditorTab; filePath:
     reload()
   }, [request, filePath, reload])
 
+  useEffect(() => {
+    const offApplied = ipc.on('mcp:revision-applied', payload => {
+      if (payload.draftId === draft.meta?.id || payload.chapterNumber === chapterNumber) {
+        reload()
+      }
+    })
+    const offUpdated = ipc.on('mcp:draft-updated', payload => {
+      if (payload.draftId === draft.meta?.id || payload.chapterNumber === chapterNumber) {
+        reload()
+      }
+    })
+    return () => { offApplied(); offUpdated() }
+  }, [chapterNumber, draft.meta?.id, reload])
+
   // 请求只交给看得见的编辑器；被合并视图或批注审阅盖住时留在 store，露出后再交。交接后清掉，重挂不会重开气泡。
   const [annotationRevision, setAnnotationRevision] = useState<AnnotationRevision | null>(null)
   const covered = draft.mergeData !== null || annotationRevision?.phase === 'review'
@@ -221,6 +235,7 @@ function DraftChapter({ tab, filePath, projectKey }: { tab: EditorTab; filePath:
                 paragraphIndent
                 content={tab.content ?? ''}
                 filePath={filePath}
+                draftId={draft.meta?.id}
                 chapterNumber={chapterNumber}
                 recoveryHandle={recovery?.handle}
                 recoveryNonce={recovery?.nonce}

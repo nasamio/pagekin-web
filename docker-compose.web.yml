@@ -1,0 +1,26 @@
+services:
+  pagekin-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      network: host
+      args:
+        HTTP_PROXY: ${BUILD_HTTP_PROXY:-}
+        HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-}
+    container_name: pagekin-web
+    restart: unless-stopped
+    ports:
+      - "${PAGEKIN_PORT:-8095}:8095"
+    environment:
+      - PAGEKIN_PORT=8095
+      - PAGEKIN_DATA_DIR=/data/app-data
+      - PAGEKIN_NOVELS_DIR=/data/novels
+      - PAGEKIN_AUTH_PASSWORD=${PAGEKIN_AUTH_PASSWORD:-}
+      - PAGEKIN_MCP_TOKEN=${PAGEKIN_MCP_TOKEN:-}
+      - PAGEKIN_LOCALE=${PAGEKIN_LOCALE:-zh-CN}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1}
+    volumes:
+      - ./data/app-data:/data/app-data
+      - ./data/novels:/data/novels

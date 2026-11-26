@@ -1409,9 +1409,58 @@ export interface MCPChannels {
   'mcp:get-config-path': { args: []; return: string }
 }
 
+export interface WebPendingRevisionPayload {
+  draftId: number
+  chapterNumber?: number
+  before: string
+  after: string
+  annotations: import('./editor-inline-generation').EditorInlineAnnotation[]
+  summary: string
+  createdAt: string
+  source: 'mcp'
+}
+
+export interface WebHostChannels {
+  'web:pending-annotations:get': {
+    args: [draftId: number | undefined, chapterNumber: number | undefined, expectedProjectPath: string]
+    return: import('./editor-inline-generation').EditorInlineAnnotation[]
+  }
+  'web:pending-annotations:set': {
+    args: [draftId: number | undefined, chapterNumber: number | undefined, annotations: import('./editor-inline-generation').EditorInlineAnnotation[], expectedProjectPath: string]
+    return: { success: boolean }
+  }
+  'web:pending-annotations:clear': {
+    args: [draftId: number | undefined, chapterNumber: number | undefined, expectedProjectPath: string]
+    return: { success: boolean }
+  }
+  'web:pending-revision:get': {
+    args: [draftId: number, expectedProjectPath: string]
+    return: WebPendingRevisionPayload | null
+  }
+  'web:pending-revision:clear': {
+    args: [draftId: number, expectedProjectPath: string]
+    return: { success: boolean }
+  }
+  'web:projects:discover': {
+    args: []
+    return: Array<{ name: string; path: string; projectId?: string; genre?: string; chapterCount: number; updatedAt: string }>
+  }
+  'web:project:grant-novels-dir': {
+    args: [purpose: 'project-create' | 'project-open', subPath?: string]
+    return: { grantId: string; displayName: string; path: string }
+  }
+}
+
+export interface WebHostEvents {
+  'mcp:revision-submitted': WebPendingRevisionPayload
+  'mcp:revision-applied': { draftId: number; chapterNumber: number; wordCount: number }
+  'mcp:draft-updated': { draftId: number; chapterNumber: number; wordCount: number }
+  'mcp:draft-created': { draftId: number; chapterNumber: number; wordCount: number }
+}
+
 // ===== 合并所有频道 =====
-export type AllInvokeChannels = LegacyRosterGenerationChannels & CharacterAvatarChannels & CloudBackupChannels & GraphGenerationChannels & FinalizationGenerationChannels & EditorInlineGenerationChannels & ImportGenerationChannels & AgentGenerationChannels & ReviewRevisionGenerationInvokeChannels & FinalizedCharacterGenerationChannels & CharacterProposalChannels & GenerationOwnerChannels & StartupChannels & WindowChannels & OfficialHomepageChannels & ModelProviderResourceChannels & ConfigChannels & UpdateChannels & ProjectChannels & FileChannels & AppDataChannels & LLMChannels & DatabaseChannels & KnowledgeBaseChannels & ChapterLifecycleChannels & ImportChannels & MCPChannels
-export type AllEventChannels = GenerationOwnerEvents & UpdateStateEvents & WindowEvents & PortableExportEvents
+export type AllInvokeChannels = WebHostChannels & LegacyRosterGenerationChannels & CharacterAvatarChannels & CloudBackupChannels & GraphGenerationChannels & FinalizationGenerationChannels & EditorInlineGenerationChannels & ImportGenerationChannels & AgentGenerationChannels & ReviewRevisionGenerationInvokeChannels & FinalizedCharacterGenerationChannels & CharacterProposalChannels & GenerationOwnerChannels & StartupChannels & WindowChannels & OfficialHomepageChannels & ModelProviderResourceChannels & ConfigChannels & UpdateChannels & ProjectChannels & FileChannels & AppDataChannels & LLMChannels & DatabaseChannels & KnowledgeBaseChannels & ChapterLifecycleChannels & ImportChannels & MCPChannels
+export type AllEventChannels = WebHostEvents & GenerationOwnerEvents & UpdateStateEvents & WindowEvents & PortableExportEvents
 
 /** 提取 invoke 频道名 */
 export type InvokeChannel = keyof AllInvokeChannels
