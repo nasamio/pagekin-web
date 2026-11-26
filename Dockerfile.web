@@ -1,4 +1,4 @@
-FROM node:22-bookworm
+FROM node:24-bookworm-slim
 
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
@@ -6,9 +6,10 @@ ARG NO_PROXY
 
 WORKDIR /app
 
-# 编译 better-sqlite3 等原生插件所需的构建工具
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 make g++ ca-certificates \
+# 使用国内镜像源加速安装编译工具，并清掉代理变量避免走慢速节点
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true \
+  && HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= apt-get update \
+  && HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= apt-get install -y --no-install-recommends python3 make g++ ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 ENV PNPM_HOME="/pnpm"
@@ -17,7 +18,7 @@ ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
 RUN corepack enable
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
-RUN pnpm install --frozen-lockfile --ignore-scripts \
+RUN HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= pnpm install --frozen-lockfile --ignore-scripts --registry=https://registry.npmmirror.com \
   && pnpm rebuild better-sqlite3
 
 COPY . .
